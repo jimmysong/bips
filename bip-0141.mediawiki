@@ -38,6 +38,9 @@ By removing this data from the transaction structure committed to the transactio
 
 ==Specification==
 
+=== Block Header ===
+Bits 16 to 23 of the version are reserved for miner use as a nonce-space.
+
 === Transaction ID ===
 
 A new data structure, <code>witness</code>, is defined. Each transaction will have 2 IDs.
@@ -79,7 +82,7 @@ and the coinbase's input's witness must consist of a single 32-byte array for th
 
 If there are more than one <code>scriptPubKey</code> matching the pattern, the one with highest output index is assumed to be the commitment.
 
-If all transactions in a block do not have witness data, the commitment is optional.
+The commitment is required regardless of whether there is a witness transaction in the block or not.
 
 === Witness program ===
 
