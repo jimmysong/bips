@@ -1,0 +1,525 @@
+<pre>
+  BIP: 22
+  Layer: API
+  Title: BetterHash Mining Protocol(s)
+  Author: Matt Corallo
+  Status: Draft
+  Type: Standards Track
+  Created: 2018-03-12
+  License: BSD-2-Clause
+</pre>
+
+==Abstract==
+
+We propose two new mining protocols to rethink the way in which work is
+generated in the Bitcoin network, potentially drastically increasing effective
+mining decentralization.
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
+"SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be
+interpreted as described in RFC 2119.
+
+==Motivation==
+
+Currently, miners connect to pool servers using the Stratum protocol, which has
+a number of drawbacks:
+* Stratum requires the pool to select the work. This means that, from the Bitcoin network's point of view, the pool acting as the miner instead of the hardware owner/operator, drastically increasing effective miner centralization and crippling the Bitcoin system's ability to achieve some of its key goals.
+* Stratum is currently unauthenticated. This drastically reduces network security against short-term attacks as man-in-the-middle attackers can gain control of large amounts of hashpower until human operators are able to notice and take corrective action.
+* Stratum has a few protocol quirks which result in it being difficult to implement, plus lack of documentation is often cited as a major blocker.
+* The simple implementation of Stratum clients results in each miner at large farms being pointed at a common, remote, Stratum server. This leads to potentially thousands or tens of thousands of individual TCP connections to each pool.
+
+Further, pool servers currently use getblocktemplate, as well as a number of
+other Bitcoin Core APIs to get new work and monitor for block updates. This has
+a number of drawbacks:
+* getblocktemplate's longpolling can be difficult to implement in an efficient and reliable way, leaving many miners to get block updates using other API features, piecing together the needed APIs in unsupported ways and relying on internal ordering within Bitcoin Core.
+* getblocktemplate provides significantly more data then must pool servers want, forcing them to do more work in the form of hashing transactions to build the merkle tree, as well as complicating protocol upgrades, such as the SegWit rollout.
+* getblocktemplate's pull-based architecture prevents Bitcoin Core from implementing various tweaks to further improve latency for miners.
+
+We propose two separate but related protocols - one which carries work
+information (roughly analogous to what Stratum provides today) and one which
+carries pool payout information. This allows us to effectively splits the job
+of a pool in two - allowing end users to do the work of selecting transactions
+(or allowing them to select a separate pool for that job) while the pool is
+left only splitting rewards between their users. The work-carrying protocol is
+intended both as a replacement for getblocktemplate as well as a replacement
+for Stratum when passed directly to the mining hardware, while the payout
+protocol is intended only for pool<->client communication.
+
+Additionally, we propose a simple protocol by which multiple clients on the
+same LAN can find peers which are connected to the same pool/work-provider and
+simply multiplex their connection using each other as a proxy.
+
+While it may have been possible to add the required features as extensions in
+Stratum, the architectural changes required to allow clients to build work
+provides a good opportunity to replace the protocol wholesale, fixing some of
+its quirks.
+
+==Protocols Overview==
+
+The Work Protocol pushes new unique work to clients in one of three modes. "Non-final" work mode is work which does not include a payout, and describes how to build a coinbase transaction, as well as a merkle path covering transactions in a block and block header information. Clients can use "non-final" work to generate work which pays out to a pool server. "Final" work information is very similar, but includes full payout information, intended to be sent to hardware controllers for mining. "Headers" work assumes that clients are capable of rolling the nVersion field in addition to the nonce in the block header a sufficient number of times to generate a full seconds worth of work, allowing them to saturate their work by rolling the header nTime field once per second. For such clients, no coinbase transaction or merkle path information need be sent, greatly simplifying the protocol (this obviously implies "final" work, as clients are not able to fill in payout information in the coinbase transaction).
+
+The Pool Protocol is comparatively simpler, focused primarily on sending PAYOUT_INFO messages to clients which can be used to construct "final" work. Clients send SHAREs to the pool as proof of work, allowing them to claim pooled rewards. The Pool Protocol has an optional additional feature for pools which wish to optimize block propagation, whereby clients send WEAK_BLOCKs to the pool server so that uploads of full blocks are efficient.
+
+Both protocols start with a PROTOCOL_SUPPORT/PROTOCOL_VERSION handshake, with the server (pool or work) sending initial COINBASE_PREFIX_POSTFIX+BLOCK_TEMPLATE (in the case of a work server) or initial PAYOUT_INFO+SHARE_DIFFICULTY (in the case of a pool server) immediately upon completion of the handshake. Thereafter, servers can push updates to the work/payout/difficulty information as needed, with clients submitted valid shares via WINNING_NONCE or SHARE/WEAK_BLOCK messages.
+
+==Sample Network Topologies==
+
+This section is non-normative, but provides some examples of expected deployment scenarios.
+
+===Large Mining Farm===
+
+     ASICs ASICs ASICs ASICs
+        \    |     |    / (via stratum or work protocol)
+     Farm Proxy/Mining Controller
+    / (via work protocol)      \ (via pool protocol)
+ local bitcoind                 remote pool
+
+In this setup, a Mining Controller (eg a cheap ARM-based server) accepts incoming connections from ASIC miners. These connections can either use stratum (for backward compatibility) or the new work protocol (optionally in headers mode, which greatly simplifies the logic at the ASIC level - allowing the ASIC firmware to skip even implementing merkle-path-hashing/coinbase transaction construction logic). This Mining Controller gets work via the work protocol (never in headers mode) from a local bitcoind (optionally on the same device, for simplicity) and connects to one or more remote pools using the pool protocol. With a BLOCK_TEMPLATE from the bitcoind and a PAYOUT_INFO from the pool server, the Mining Controller can construct unique work which pays out to the pool but contains transactions selected by a local node for distribution to the ASICs. Blocks which meet the pool's SHARE_DIFFICULTY's ''share_target'' are sent (with just the coinbase transaction, merkle path, and block header) to the pool for verification and payout, and blocks which meet the Bitcoin network difficulty are sent to the local bitcoind. The pool can optionally request that full blocks be sent at a secondary difficulty (using a weak-block-based compression scheme) so that the pool receives full-difficulty blocks for relaying as well.
+
+==Specification of Work Protocol==
+
+# All messages are serialized on the wire with a 1-byte ''message_type'' prefix, followed by the message itself. All numbers are encoded as little-endian unless otherwise specified.
+
+# The protocol begins with a version handshake, with the "client" (ie work-receiver) sending a PROTOCOL_SUPPORT message, and the "server" (ie work-provider) responding with a PROTOCOL_VERSION.
+
+# The PROTOCOL_VERSION message includes a ''public_key'' which will be used to sign various other messages sent from the server to the client.
+#* Clients MUST, at minimum, implement a Trust-On-First-Use authentication mechanism and use the provided ''public_key'' to authenticate any remaining messages from the same work provider, even across disconnects/reconnects, for one session.
+#* Clients MAY allow the user to specify the expected ''public_key''.
+#* Clients SHOULD provide UI-exposed TOFU-state reset mechanisms (ie which reconnect and allow the server to provide any public key). Clients MAY do so only upon power-cyle (eg by storing TOFU state only in memory and not persisting it to non-volatile storage).
+#* Servers MUST persist the private key corresponding to the ''public_key'' to non-volitile storage and use the same key persistently.
+#* Currently only the bits at index 6 and 7 (ie the low-order two bits when serialized as a 16-bit little-endian number) in ''flags'' are defined, all other bits SHOULD be set to 0 by clients.
+#* Servers which receive unknown bits set in PROTOCOL_SUPPORT ''flags'' SHOULD simply ignore them and not include them in the responding PROTOCOL_VERSION ''flags''.
+#* If bit 7 is set in PROTOCOL_VERSION ''flags'', the server MUST set ''coinbase_tx_remaining_value'' in each BLOCK_TEMPLATE message to 0, and fully claim any coinbase transaction reward in ''coinbase_tx_outputs_to_append''. If bit 7 is not set in PROTOCOL_VERSION ''flags'', the value of all entries in ''coinbase_tx_outputs_to_append'' MUST be 0.
+#* If bit 6 is set in ''flags'' in PROTOCOL_VERSION, the server MUST never send BLOCK_TEMPLATE or COINBASE_PREFIX_POSTFIX messages, instead sending BLOCK_TEMPLATE_HEADER messages which incorporate any relevant ''coinbase_prefix_postfix'' data when a BLOCK_TEMPLATE message may be required. The client in the connection MUST NOT send WINNING_NONCE messages, instead sending WINNIN_NONCE_HEADER messages when WINNIN_NONCE messages are required. This effectively implies bit 7, as the server MUST fully claim any coinbase transaction reward within the coinbase transaction committed to by each BLOCK_TEMPLATE_HEADER's ''merkle_root''.
+#* If bit 6 in PROTOCOL_VERSION ''flags'' is set, bit 7 MUST be set as well.
+#* Bits 6 and 7 in PROTOCOL_SUPPORT ''flags'' indicates four different possible sets of accepted PROTOCOL_VERSION ''flags'' as listed in the following table. A server MUST NOT respond with a PROTOCOL_VERSION ''flags'' outside of those allowed below, instead disconnecting clients which request modes the server does not support.
+{|
+|Bits||Client support
+|-
+|0b00||Client wishes to add their own extra data in the coinbase, as well as their own payout information. Thus, bits 6 and 7 in PROTOCOL_VERSION ''flags'' MUST be 0.
+|-
+|0b01||Client must fill in their own extra data in the coinbase, but cannot fill out their own payout information. Thus, bit 6 in PROTOCOL_VERSION ''flags'' MUST be unset, while bit 7 in PROTOCOL_VERSION ''flags'' MUST be set.
+|-
+|0b10||Client can optionally build their own coinbase transaction, but does not require it for correct operation, and cannot fill out their own payout information. Thus, bit 6 in PROTOCOL_VERSION ''flags'' may be any value, while bit 7 in PROTOCOL_VERSION ''flags'' MUST be set.
+|-
+|0b11||Client does not support building their own coinbase transaction, and thus cannot fill out their own payout information. Thus, both bit 6 and 7 in PROTOCOL_VERSION ''flags'' MUST be set (ie 0b11).
+|}
+
+<ol start="4">
+<li>After the version handshake, an optional COINBASE_PREFIX_POSTFIX may be sent from server to client.
+* A client MUST verify the ''signature'' over the COINBASE_PREFIX_POSTFIX message before acting on it, disconnecting the work provider and attempting to reconnect if the signature is invalid.
+* A client SHOULD verify the given ''message_timestamp'' is within acceptable bounds (ie close to now).
+* A client MUST always add the ''coinbase_prefix_postfix'' to their work, and MUST always ignore any COINBASE_PREFIX_POSTFIX messages which have a ''message_timestamp'' lower than the highest ''message_timestamp'' which is within reasonable range.
+* In order to limit round-trip latency-related solution rejections, client SHOULD flush work upon receipt of a COINBASE_PREFIX_POSTFIX message, and servers SHOULD limit the number of COINBASE_PREFIX_POSTFIX messages sent as much as possible.
+* A server MUST ensure that the ''coinbase_prefix_postfix'' uniquely identifies a client. This ensures work is not duplicated, and authenticates share submissions to clients.
+* For effeciency, a server MAY rely on a client's WINNING_NONCE messages' ''coinbase_tx'' using a ''coinbase_prefix_postfix'' from a COINBASE_PREFIX_POSTFIX message sent on the same connection. Thus, clients MUST only use ''coinbase_prefix_postfix'' data provided on the same socket connection on which they are submitting shares.
+</li>
+
+<li>After the initial handshake and potentially a COINBASE_PREFIX_POSTFIX, an initial BLOCK_TEMPLATE (or BLOCK_TEMPLATE_HEADER) message MUST be sent from server to client, and the server SHOULD send new BLOCK_TEMPLATE (or BLOCK_TEMPLATE_HEADER) messages whenever its view of the current best block changes or total coinbase transaction reward changes materially.
+* A client MUST verify the ''signature'' over the BLOCK_TEMPLATE message before acting on it, disconnecting the work provider and attempting to reconnect if the signature is invalid.
+* A client SHOULD verify the given ''template_timestamp'' is within acceptable bounds (ie close to now).
+* A server SHOULD accept work on old BLOCK_TEMPLATEs which have the same ''previous_block'' as the most recent BLOCK_TEMPLATE for at least 30 seconds.
+* The total length of the ''coinbase_prefix_postfix'' and any ''coinbase_prefix''s and any ''coinbase_postfix''s sent in BLOCK_TEMPLATEs MUST NOT exceed 92 bytes in length (not including length bytes). This ensures clients are able to use 8 bytes for extra nonce space.
+* The total length of the ''coinbase_prefix_postfix'' and any ''coinbase_prefix''s sent in BLOCK_TEMPLATEs by servers providing non-final work (ie where ''coinbase_tx_remaining_value'' is non-0 MUST NOT exceed 42 bytes in length (not including length bytes). Further, any such non-final BLOCK_TEMPLATEs MUST have a 0-length ''coinbase_postfix''. This ensures pools have at least 42 bytes of available ''coinbase_postfix'' space once any proxies have claimed up to 8 bytes in space.
+* A server MAY drop all work on old BLOCK_TEMPLATEs which have a different ''previous_block'' from the most recent BLOCK_TEMPLATE.
+* Thus, a client SHOULD flush work upon a ''previous_block'' change, but MAY do so lazily otherwise.
+</li>
+
+<li>A client builds a coinbase transaction and candidate header as follows:
+# The client MAY use any remaining space in the coinbase field (up to 100 bytes) as additional nonce space. Due to limitations on BLOCK_TEMPLATE ''coinbase_prefix'', COINBASE_PREFIX_POSTFIX's ''coinbase_prefix_postfix'' and Pool PAYOUT_INFO's ''coinbase_postfix'', clients are guaranteed at least 8 bytes available for this purpose.
+# Once the client has chosen its intended extra nonce size, the coinbase is constructed by concatenating the highest-timestamp BLOCK_TEMPLATE ''coinbase_prefix'' with the highest-timestamp COINBASE_PREFIX_POSTFIX ''coinbase_prefix_postfix'', followed by any extra nonce information and then the BLOCK_TEMPLATE ''coinbase_postfix''.
+# Once the client has constructed the coinbase, the first part of the coinbase transaction is constructed by concatenating the ''coinbase_tx_version'' with the length of the coinbase field, the constructed coinbase field, and the ''coinbase_tx_input_nSequence''.
+# If ''coinbase_tx_remaining_value'' is non-0 (implying the bit at index 7 of the PROTOCOL_SUPPORT ''flags'' was not set), the first output in the coinbase transaction SHOULD pay to the client the entire remaining value.
+# The coinbase transaction is then completed by appending the ''coinbase_tx_outputs_to_append'' and ''coinbase_locktime'' from the BLOCK_TEMPLATE. Note that clients which do not accept any remaining output value MAY do this by simply appending all remaining data in the message using the ''coinbase_tx_remaining_data_len'' as a length indicator.
+* Note that, as the coinbase field MUST NOT exceed 100 bytes in length, the coinbase length field is always 1 byte in length, so clients which use the ''coinbase_tx_remaining_data_len'' field for encoding need not ever implement CompactSize serialization/deserialization.
+* Servers providing non-final work (ie where ''coinbase_tx_remaining_value'' is non-0) MUST NOT allow ''coinbase_tx_remaining_data_len'' to exceed 32767 bytes to provide room for any additional outputs provided by the pool server.
+* Clients MAY change the block header version field bits which are reserved by BIP YYYY (TODO: Drak's BIP) and increment the block header timestamp by 1 once a second when generating their work. Clients MUST NOT change any bits in the block header version field which are not reserved by BIP YYYY (TODO) or allow the block header timestamp to be incremented faster than wall clock time.
+</li>
+
+<li>When a client finds a combination of nonces which results in a block header hash smaller than the ''target_hash'' in the corresponding BLOCK_TEMPLATE message, they SHALL submit a WINNING_NONCE message with the fully-constructed coinbase transaction and nonces filled in.
+* ''user_tag'' may be set to anything, up to 255 bytes in length. It MAY be used for reporting and statistics-gathering purposes and to track performance. ''user_tag'' MUST NOT be used in the calculation of payout information as it is, unlike the remainder of the message, unauthenticated by the work itself.
+</li>
+
+<li>Clients which need the full set of transactions in the block which is being worked on (eg for compact-block relay to a pool), may request them using a TRANSACTION_DATA_REQUEST message.
+* Servers receiving a TRANSACTION_DATA_REQUEST message with a ''template_timestamp'' matching a recently-sent BLOCK_TEMPLATE MUST respond with a signed TRANSACTION_DATA message which provides contains the full set of transactions which were used to build the ''merkle_path'' in the BLOCK_TEMPLATE.
+* Clients which do not receive a TRANSACTION_DATA message in response to a TRANSACTION_DATA_REQUEST in a timely manner SHOULD prefer to use work from other work providers.
+* Note that the hashes used to build the BLOCK_TEMPLATE ''merkle_path'' are the non-SegWit Bitcoin transaction txids, but the transactions in ''transactions'' MUST be serialized using any witnesses which are committed to by the SegWit commitment included in the BLOCK_TEMPLATE ''coinbase_tx_outputs_to_append''. Thus, to avoid complexity on the client end, verification of the ''merkle_path'' and SegWit commitment is OPTIONAL.
+</li>
+
+<li>TODO: Describe BLOCK_TEMPLATE_HEADER/WINNING_NONCE_HEADER variants
+* A server MUST ensure that the work provided in a BLOCK_TEMPLATE_HEADER message is globally unique, including unique with previously-closed connections.
+</li>
+</ol>
+
+===Message Definitions===
+
+====PROTOCOL_SUPPORT====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 1||The message type
+|-
+|max_version||uint16_t||2 bytes||Little-Endian Integer||The maximum protocol version the client supports (currently must be 1)
+|-
+|min_version||uint16_t||2 bytes||Little-Endian Integer||The minimum protocol version the client supports (currently must be 1)
+|-
+|flags||uint16_t||2 bytes||16 flag bits||Flags indicating optional protocol features the client supports (currently only values between 0 and 3, inclusive are defined)
+|}
+
+====PROTOCOL_VERSION====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 2||The message type
+|-
+|version||uint16_t||2 bytes||Little-Endian Integer||The version the server has selected to use (currently always 1)
+|-
+|flags||uint16_t||2 bytes||16 flag bits||Flags indicating optional protocol features which the server selected for use.
+|-
+|public_key||secp256k1 Public Key||33 bytes||"Compressed" secp256k1 public key||The public key which will be used for authentication of remaining messages
+|}
+
+====BLOCK_TEMPLATE====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 3||The message type
+|-
+|signature||secp256k1 compact signature||64 bytes||secp256k1 ECDSA signature encoded as R, S, both in big endian||Signature over SHA256(3 followed by all remaining data in this message)
+|-
+|template_timestamp||uint64_t||8 bytes||Little-Endian Integer||The timestamp when this template was generated, in milliseconds since January 1st, 1970
+|-
+|target_hash||uint256||32 bytes||Little-Endian Integer||The target hash value which work responses should match (encoded as little-endian which the block hash should be lower than, when interpreted as little-endian)
+|-
+|default_header_version||uint32_t||4 bytes||Little-Endian Integer||The default version field in the block header
+|-
+|previous_block||block hash||32 bytes||Block Hash as standard double-SHA256 output||The block hash of the current best block (on which new blocks should be built)
+|-
+|default_header_time||uint32_t||4 bytes||Little-Endian Integer||The default timestamp field in the block header
+|-
+|header_nbits||uint32_t||4 bytes||Little-Endian Integer||The "nBits" field in the block header
+|-
+|merkle_path||array of 32-byte hashes||1 + N*32 bytes||1 count byte + N 32-byte double-SHA256 hashes||Merkle path to coinbase transaction
+|-
+|coinbase_tx_remaining_value||uint64_t||8 bytes||Little-Endian Integer||The remaining value to be allocated to local payout address
+|-
+|coinbase_tx_version||uint32_t||4 bytes||Little-Endian Integer||The version field which should be set on the coinbase transaction
+|-
+|coinbase_prefix||byte array||1-97 bytes||1 length byte + N bytes||The data which should be placed at the beginning of the coinbase field in the coinbase transaction
+|-
+|coinbase_postfix||byte array||1-97 bytes||1 length byte + N bytes||The data which should be placed at the end of the coinbase field in the coinbase transaction
+|-
+|coinbase_tx_input_nSequence||uint32_t||4 bytes||Little-Endian Integer||The coinbase transaction's input's nSequence field
+|-
+|coinbase_tx_remaining_data_len||uint16_t||2 bytes||Little-Endian Integer||The length of the remaining coinbase trasaction data (ie the length of the outputs + the coinbase transaction locktime)
+|-
+|coinbase_tx_output_count||Compact Size||1-5 bytes||Using standard Bitcoin protocol compact size encoding||The number of outputs to append to the end of the coinbase transaction
+|-
+|coinbase_tx_outputs_to_append||Transaction Outputs||N*(8 + P + M) bytes||list of CTxOuts serialized in standard Bitcoin format (8 byte value|compactsize length|scriptPubKey)||Outputs which should be included in the coinbase transaction at the end of the output list
+|-
+|coinbase_locktime||uint32_t||4 bytes||Little-Endian Integer||The locktime field of the coinbase transaction
+|}
+
+====WINNING_NONCE====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 4||The message type
+|-
+|template_timestamp||uint64_t||8 bytes||Little-Endian Integer||The template timestamp field copied from the BLOCK_TEMPLATE message which was used to generate this work
+|-
+|header_version||uint32_t||4 bytes||Little-Endian Integer||The version field in the block header
+|-
+|header_timestamp||uint32_t||4 bytes||Little-Endian Integer||The timestamp field in the block header
+|-
+|header_nonce||uint32_t||4 bytes||Little-Endian Integer||The nonce field in the block header
+|-
+|user_tag||bytes||1-256 bytes||length byte followed by N bytes||A free tag which can be filled in for statistics purposes
+|-
+|coinbase_tx_length||uin32_t||4 bytes||Little-Endian Integer||The length of the coinbase transaction (and the rest of this message)
+|-
+|coinbase_tx||Transaction||47+ bytes||Like any other Bitcoin transaction||The fully-formed encoded coinbase transaction
+|}
+
+====TRANSACTION_DATA_REQUEST====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 5||The message type
+|-
+|template_timestamp||uint64_t||8 bytes||Little-Endian Integer||The template timestamp field copied from the BLOCK_TEMPLATE message which the client wants the full transactions for
+|}
+
+====TRANSACTION_DATA====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 6||The message type
+|-
+|signature||secp256k1 compact signature||64 bytes||secp256k1 ECDSA signature encoded as R, S, both in big endian||Signature over SHA256(6 followed by all remaining data in this message)
+|-
+|template_timestamp||uint64_t||8 bytes||Little-Endian Integer||The template timestamp field copied from the TRANSACTION_DATA_REQUEST message which the server is providing the full transactions for
+|-
+|tx_count||uint32_t||4 bytes||Little-Endian Integer||The number of transactions that follow (which should be the total number of transactions in the candidate block - 1 for the coinbase transaction)
+|-
+|transactions||list of transactions||N * (4 + tx len) bytes||4-byte transaction data length followed by transaction data, repeated per transaction||The transactions themselves
+|}
+
+====COINBASE_PREFIX_POSTFIX====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 7||The message type
+|-
+|signature||secp256k1 compact signature||64 bytes||secp256k1 ECDSA signature encoded as R, S, both in big endian||Signature over SHA256(7 followed by all remaining data in this message)
+|-
+|message_timestamp||uint64_t||8 bytes||Little-Endian Integer||The timestamp when this message was generated, in milliseconds since January 1st, 1970
+|-
+|coinbase_prefix_postfix||bytes||1-97 bytes||1 byte length followed by N bytes||A postfix which should be added to the coinbase prefix provided in a BLOCK_TEMPLATE, prior to any other data pushes added by the client
+|}
+
+====BLOCK_TEMPLATE_HEADER====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 8||The message type
+|-
+|signature||secp256k1 compact signature||64 bytes||secp256k1 ECDSA signature encoded as R, S, both in big endian||Signature over SHA256(8 followed by all remaining data in this message)
+|-
+|template_timestamp||uint64_t||8 bytes||Little-Endian Integer||The timestamp when this template was generated, in milliseconds since January 1st, 1970
+|-
+|template_variant||uint64_t||8 bytes||Little-Endian Integer||A unique ID identifying this BLOCK_TEMPLATE_HEADER for inclusion in a corresponding WINNIN_NONCE_HEADER message
+|-
+|target_hash||uint256||32 bytes||Little-Endian Integer||The target hash value which work responses should match (encoded as little-endian which the block hash should be lower than, when interpreted as little-endian)
+|-
+|default_header_version||uint32_t||4 bytes||Little-Endian Integer||The default version field in the block header
+|-
+|previous_block||block hash||32 bytes||Block Hash as standard double-SHA256 output||The block hash of the current best block (on which new blocks should be built)
+|-
+|merkle_root||uint256||32 bytes||Double SHA256 Hash||The merkle root field in the block header
+|-
+|default_header_time||uint32_t||4 bytes||Little-Endian Integer||The default timestamp field in the block header
+|-
+|header_nbits||uint32_t||4 bytes||Little-Endian Integer||The "nBits" field in the block header
+|}
+
+====WINNING_NONCE_HEADER====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 9||The message type
+|-
+|template_timestamp||uint64_t||8 bytes||Little-Endian Integer||The template timestamp field copied from the BLOCK_TEMPLATE message which was used to generate this work
+|-
+|template_variant||uint64_t||8 bytes||Little-Endian Integer||The ''template_variant'' from the corresponding BLOCK_TEMPLATE_HEADER message
+|-
+|header_version||uint32_t||4 bytes||Little-Endian Integer||The version field in the block header
+|-
+|header_timestamp||uint32_t||4 bytes||Little-Endian Integer||The timestamp field in the block header
+|-
+|header_nonce||uint32_t||4 bytes||Little-Endian Integer||The nonce field in the block header
+|-
+|user_tag||bytes||1-256 bytes||length byte followed by N bytes||A free tag which can be filled in for statistics purposes
+|}
+
+==Specification of Pool Protocol==
+
+# All messages are serialized on the wire with a 1-byte ''message_type'' prefix, followed by the message itself. All numbers are encoded as little-endian unless otherwise specified.
+
+# The protocol begins with a version handshake, with the "client" (ie work-receiver) sending a PROTOCOL_SUPPORT message, and the "server" (ie work-provider) responding with a PROTOCOL_VERSION.
+
+# The PROTOCOL_VERSION message includes a ''public_key'' which will be used to sign various other messages sent from the server to the client.
+#* Clients MUST, at minimum, implement a Trust-On-First-Use authentication mechanism and use the provided ''public_key'' to authenticate any remaining messages from the same work provider, even across disconnects/reconnects, for one session.
+#* Clients MAY allow the user to specify the expected ''public_key''.
+#* Clients SHOULD provide UI-exposed TOFU-state reset mechanisms (ie which reconnect and allow the server to provide any public key). Clients MAY reset TOFU state upon power-cyle (eg by storing TOFU state only in memory and not persisting it to non-volatile storage).
+#* Servers MUST persist the private key corresponding to the ''public_key'' to non-volitile storage and use the same key persistently.
+#* Currently no bits in ''flags'' in either PROTOCOL_SUPPORT or PROTOCOL_VERSION are defined, clients SHOULD set ''flags'' to 0.
+#* Servers which receive unknown bits set in PROTOCOL_SUPPORT ''flags'' SHOULD simply ignore them and not include them in the responding PROTOCOL_VERSION ''flags''.
+
+# After the initial handshake, the client sends a GET_PAYOUT_INFO message to the server, identifying itself and requesting corresponding PAYOUT_INFO and SHARE_DIFFICULTY messages.
+#* Successful authentication via a GET_PAYOUT_INFO message SHOULD NOT enable the user to perform any action aside from contribute to the reward of the user identified by ''user_id''. Thus, weak authentication in ''user_auth'' is considered acceptable, however pools MAY wish to use ''user_auth'' to require clients perform a cryptographic authentication scheme (eg by performing ECDH with the pool's static public key and an ephemeral key, and using the result to encrypt a password).
+#* If the pool requires authentication and GET_PAYOUT_INFO fails to identify a correctly-authenticated user, the server MUST disconnect the client immediately upon receipt of the GET_PAYOUT_INFO message.
+
+# After successful authentication using GET_PAYOUT_INFO, an initial SHARE_DIFFICULTY message MUST be sent from server to client, and the server MAY send additional SHARE_DIFFICULTY messages to limit the volume of SHARE and WEAK_BLOCK messages to a reasonable rate.
+#* A client MUST verify the ''signature'' over the SHARE_DIFFICULTY message before acting on it, disconnecting from the pool and attempting to reconnect if the signature is invalid.
+#* A client SHOULD verify the given ''message_timestamp'' is within acceptable bounds (ie close to now).
+#* A client MUST always ignore any SHARE_DIFFICULTY message which has a ''message_timestamp'' lower than the highest ''message_timestamp'' which is within reasonable range which the client has seen used in a SHARE_DIFFICULTY message.
+#* TODO: Should SHARE_DIFFICULTY include some kind of client id so that proxies cant cheat? Probably not since a proxy can simply drop a diff update anyway so they're already semi-trusted in that regard...
+#* Clients which find work which meets the ''share_target'' MUST send a SHARE message as described below.
+#* Clients which find work which meets the ''weak_block_target'' MUST send a WEAK_BLOCK message as described below.
+#* Clients which find a valid SHARE which meets both the current ''weak_block_target'' and ''share_target'' MUST submit both SHARE and WEAK_BLOCK messages.
+
+# After the initial handshake, authentication, and a SHARE_DIFFICULTY, an initial PAYOUT_INFO message MUST be sent from server to client.
+#* A client MUST verify the ''signature'' over the PAYOUT_INFO message before acting on it, disconnecting from the pool and attempting to reconnect if the signature is invalid.
+#* A client MUST verify that the ''user_id'' field in the PAYOUT_INFO matches the GET_PAYOUT_INFO which they sent's ''user_id'' field to ensure the work pays into their pool account, disconnecting from the pool if the signature is invalid.
+#* A client SHOULD verify the given ''message_timestamp'' is within acceptable bounds (ie close to now).
+#* A client MUST always ignore any PAYOUT_INFO message which has a ''message_timestamp'' lower than the highest ''message_timestamp'' which is within reasonable range which the client has seen used in a PAYOUT_INFO message.
+#* The ''coinbase_postfix'' MUST unambiguously identify the user to the pool, allowing them to identify the source of SHAREs and authenticate them to users.
+#* Pools MAY prevent duplicate share submissions across users or independent parts of their infrastructure by ensuring the ''coinbase_postfix'' is unique, however, ''coinbase_postfix'' MAY be non-unique for a given user - the user MUST ensure they build unique work no matter the contents of PAYOUT_INFO.
+
+# Upon discovery of a set of nonces which meets the current ''share_target'', a client MUST construct a SHARE message and relay it to the server.
+#* The server MUST verify that the ''coinbase_tx'' have a coinbase field which ends with a ''coinbase_postfix'' which was given out to a user. The server MUST NOT identify payout information based on anything other than the ''coinbase_postfix'' identification.
+#* The first output in the ''coinbase_tx'' MUST pay out to the PAYOUT_INFO which included the ''coinbase_postfix'' used's ''remaining_payout_script''.
+#* The ''coinbase_tx''s next outputs MUST be those included in the same PAYOUT_INFO's ''appended_outputs'', followed by any outputs which the client wished to add for non-payout purposes.
+#* Any outputs added by the client with the exception of the first output MUST have 0 value.
+#* ''user_tag'' may be set to anything, up to 255 bytes in length. It MAY be used for reporting and statistics-gathering purposes and to track performance. ''user_tag'' MUST NOT be used in the calculation of payout information as it is, unlike the remainder of the SHARE message, unauthenticated by the work itself.
+#* Pool servers SHOULD accept SHAREs which have a ''previous_block'' field which matches any block the pool considers valid which has the same total work as the most-total-work block the pool has seen (ie pools SHOULD accept SHAREs built on blocks they consider stale, as long as they have the same total work as their current tip).
+#* TODO: Have some mechanism for clients to relay such a block/header to the pool, as they may not otherwise propagate? :(
+
+TODO: Describe WEAK_BLOCKS stuff
+
+TODO: Describe NEW_POOL_SERVER
+
+TODO: Decide if we want a key rotation message of some form. Probably?
+
+===Message Definitions===
+
+====PROTOCOL_SUPPORT====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 1||The message type
+|-
+|max_version||uint16_t||2 bytes||Little-Endian Integer||The maximum protocol version the client supports (currently must be 1)
+|-
+|min_version||uint16_t||2 bytes||Little-Endian Integer||The minimum protocol version the client supports (currently must be 1)
+|-
+|flags||uint16_t||2 bytes||16 flag bits||Flags indicating optional protocol features the client supports
+|}
+
+====PROTOCOL_VERSION====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 2||The message type
+|-
+|version||uint16_t||2 bytes||Little-Endian Integer||The version the server has selected to use (currently always 1)
+|-
+|flags||uint16_t||2 bytes||16 flag bits||Flags indicating optional protocol features which the server selected for use.
+|-
+|public_key||secp256k1 Public Key||33 bytes||"Compressed" secp256k1 public key||The public key which will be used for authentication of remaining messages
+|}
+
+====GET_PAYOUT_INFO====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 10||The message type
+|-
+|user_id||String||1-256 bytes||1 byte length followed by up to 255 bytes of characters||The user's identification string
+|-
+|user_auth||String||1-256 bytes||1 byte length followed by up to 255 bytes of characters||Any additional data the user must provide to authenticate themselves.
+|}
+
+====PAYOUT_INFO====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 11||The message type
+|-
+|signature||secp256k1 compact signature||64 bytes||secp256k1 ECDSA signature encoded as R, S, both in big endian||Signature over SHA256(11 followed by all remaining data in this message)
+|-
+|user_id||String||1-256 bytes||1 byte length followed by up to 255 bytes of characters||The user's identification string
+|-
+|message_timestamp||uint64_t||8 bytes||Little-Endian Integer||The timestamp when this message was generated, in milliseconds since January 1st, 1970
+|-
+|coinbase_postfix||bytes||1-43 bytes||length byte followed by N bytes||The data which must appear in the coinbase field immediately prior to the last 8 bytes of the coinbase
+|-
+|remaining_payout_script||Script||2-32758 bytes||2 length bytes in LE followed by N byte script||The scriptPubKey which shall receive all remaining value of the coinbase transaction reward
+|-
+|appended_outputs_count||uint8_t||2 bytes||Little-Endian Integer||The number of outputs which shall appear after the self and remaining payout outputs in the coinbase transaction
+|-
+|appended_outputs||Transaction Outputs||N*(8 + 2 + M) bytes||list of outputs serialized as (8 byte value|2 byte scriptPubKey length|scriptPubKey)||The outputs themselves
+|}
+
+====SHARE_DIFFICULTY====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 12||The message type
+|-
+|signature||secp256k1 compact signature||64 bytes||secp256k1 ECDSA signature encoded as R, S, both in big endian||Signature over SHA256(12 followed by all remaining data in this message)
+|-
+|message_timestamp||uint64_t||8 bytes||Little-Endian Integer||The timestamp when this message was generated, in milliseconds since January 1st, 1970
+|-
+|share_target||uint256||32 bytes||Little-Endian Integer||The share target to compare to block hashes of shares
+|-
+|weak_block_target||uint256||32 bytes||Little-Endian Integer||The target to compare to block hashes of shares for which weak blocks must be submitted
+|}
+
+====SHARE====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 13||The message type
+|-
+|header_version||uint32_t||4 bytes||Little-Endian Integer||The version field in the block header
+|-
+|previous_block||block hash||32 bytes||Block Hash as standard double-SHA256 output||The block hash of the previous block on which this share was built
+|-
+|header_timestamp||uint32_t||4 bytes||Little-Endian Integer||The timestamp field in the block header
+|-
+|header_nbits||uint32_t||4 bytes||Little-Endian Integer||The "nBits" field in the block header
+|-
+|header_nonce||uint32_t||4 bytes||Little-Endian Integer||The nonce field in the block header
+|-
+|merkle_path||array of 32-byte hashes||1 + N*32 bytes||1 count byte + N 32-byte double-SHA256 hashes||Merkle path to coinbase transaction
+|-
+|coinbase_tx_length||uin32_t||4 bytes||Little-Endian Integer||The length of the coinbase transaction
+|-
+|coinbase_tx||Transaction||47+ bytes||Like any other Bitcoin transaction||The fully-formed encoded coinbase transaction
+|-
+|user_tag||bytes||1-256 bytes||length byte followed by N bytes||A free tag which can be filled in for statistics purposes
+|}
+
+====WEAK_BLOCK====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 14||The message type
+|-
+|header_version||uint32_t||4 bytes||Little-Endian Integer||The version field in the block header
+|-
+|previous_block||block hash||32 bytes||Block Hash as standard double-SHA256 output||The block hash of the previous block on which this share was built
+|-
+|header_timestamp||uint32_t||4 bytes||Little-Endian Integer||The timestamp field in the block header
+|-
+|header_nbits||uint32_t||4 bytes||Little-Endian Integer||The "nBits" field in the block header
+|-
+|header_nonce||uint32_t||4 bytes||Little-Endian Integer||The nonce field in the block header
+|-
+|sketch_id||uint64_t||8 bytes||Little-Endian Integer||An arbitrary ID selected by the client to uniquely identify this sketch
+|-
+|prev_sketch_id||uint64_t||8 bytes||Little-Endian Integer||The ''sketch_id'' on which this sketch is based
+|-
+|txn_list||transaction pointer list||N bytes||2-bit commands with optional additional data||The list of transactions included in this block
+|}
+
+====WEAK_BLOCK_STATE_RESET====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 15||The message type
+|}
+
+====NEW_POOL_SERVER====
+{|
+|Field Name||Type||Size||Encoding||Purpose
+|-
+|message_type||byte||1 byte||The constant 16||The message type
+|-
+|signature||secp256k1 compact signature||64 bytes||secp256k1 ECDSA signature encoded as R, S, both in big endian||Signature over SHA256(16 followed by all remaining data in this message)
+|-
+|new_host_port||String||1 length byte + up to 255 byte string||String encoded as length-byte followed by host:port||New host to connect to for this pool
+|}
+
+==Discussion==
+
+; Why TCP? Isn't UDP better for low-latency relay?
+: Because the time-critical packets are designed to fit into 1 TCP frame, using TCP reduces complexity of reliable transport and NAT traversal significantly while still providing low-latency delivery.
+; Why add the complexity of the weak blocks relay?
+: Because PPS-based pooling has become a common practice for business reasons, some pools care deeply about being able to optimize the relay of blocks which pay out to them. Thus, to avoid the pools relaying heavily on their clients to do their own careful optimization, clients can be made to relay some portion of their blocks efficiently to the pool, further allowing pools to spot-check the validity of the work clients are hashing on. Pools which do not need weak-block-based relay may chose to simply set the ''weak_block_difficulty'' to the current block difficulty and send WEAK_BLOCK_STATE_RESET messages after each WEAK_BLOCK, which implies that it is unlikely the client will ever have a chance to relay a compressed weak block.
+; What are the intended UX differences for miners today?
+: This depends largely on the amount of complexity the mining hardware intends to support. For hardware which supports both, instead of the current configuration where mining firmware is directed to connect to one or more pool(s) to get work and payout information from, miners may now have two sets of host fields, one for work and one for pools. For simpler mining firmware, they may chose to only support work providers, which could be pointed to a proxy which combines work from a work provider and payout information from a pool into one stream of BLOCK_TEMPLATEs. An example of such a proxy server exists at [https://github.com/TheBlueMatt/mining-proxy the author's GitHub], which also supports acting as a stratum server for existing hardware to connect to.
+; Is it not likely that many miners will simply chose to connect to the same operator for both work and pool payout information?
+: Indeed, this is possible, however reducing the switching cost of miners for the work information is already a significant advantage over today's setup. Additionally, splitting the protocol in two can simplify pool operation greatly - allowing pool operators to simply expose Bitcoin Core as a work server can simplify the work of building a pool server.
