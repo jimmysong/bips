@@ -1,0 +1,95 @@
+<pre>
+  BIP: ???
+  Title: Encrypted Backups for Wallets
+  Author: Jimmy Song <jaejoon@gmail.com>
+  Comments-Summary: No comments yet.
+  Comments-URI: ???
+  Status: Draft
+  Type: Informational
+  License: BSD-2-Clause
+  Created: 2020-03-19
+</pre>
+
+== Introduction ==
+
+=== Abstract ===
+
+This document proposes a standard for encrypting wallet metadata.
+
+=== Copyright ===
+
+This document is licensed under the 2-clause BSD license.
+
+=== Motivation ===
+
+Wallets traditionally use backup seeds to deterministically derive the possible scriptPubKeys that can be paid to the wallet. While this works fine in the traditional single-key or even deterministic multi-key setups, once timelocks and more complicated scripts enter the picture (as they do in the Lightning Network, for example), deterministically generating all possible scriptPubKeys suffers quickly from combinatorial blowup.
+
+At the same time, storing potentially private data like Redeem/Witness scripts or labels for a given utxo require some level of security, whether through isolation of the device containing the data or through encryption of the payload.
+
+As the metadata like the Redeem/Witness scripts are extremely important to recover the UTXOs of a wallet, backing up the metadata in multiple places is not only desirable but warranted. At the same time, adding privacy through encryption gets us an optimum of both security and redundancy as the backup is strongly redundant and private.
+
+== Description ==
+
+We designate a BIP32 path using a new purpose code at the hardened derivation path (to be defined after the BIP number is assigned). The public key at that path stored with the wallet for the purpose of creating encrypted backups. The backups themselves are created using ECIES with the wallet payload sympetrically encrypted using ChaCha20 as the cipher with a Poly1305 HMAC per [https://tools.ietf.org/html/rfc7539 RFC 7539].
+
+=== Specification ===
+
+Functions:
+
+serialize(T) = compressed SEC format of secp256k1 point T
+deserialize(t) = inverse of serialize
+SHA256(x) = sha256 digest of some bytes x
+x[:y] = the first y bytes of some bytes x
+
+The wallet is given a public key ''P'', which is derived from the path (to be determined) of an extended private key as per BIP0032. We'll call the private key at the path ''s'' so ''P=sG''.
+
+As per ECIES, the wallet that's looking to backup the payload generates an ephemeral 256-bit private key for the purposes of encryption, which we'll call ''k''. We'll call the public key at this point ''Q'' which means ''Q=kG''. The shared secret is ''ksG''. To allow the private key to be able to decrypt the payload, Q is included in the encrypted payload. As ''ksG=sQ=kP'', the wallet can calculate the shared secret as can the device containing the private key.
+
+The key derivation function is one round of SHA256.
+
+The resulting 256 bit key is used in Big-Endian order for the ChaCha20-Poly1305 cipher and HMAC. A 12-byte nonce is the first 12 bytes of the SHA256 of the ephemeral public key Q in compressed SEC format. The 12-byte nonce can be fed with the 32-byte key into the ChaCha20-Poly1305 cipher to encrypt plaintext into ciphertext and HMAC. The resulting encrypted payload should be thus:
+
+k = ephemeral key
+P = public key or sG
+G = group generator for secp256k1
+Q = kG
+shared_secret = SHA256(serialize(kP))
+nonce = SHA256(serialize(kG))[:12]
+
+ciphertext, hmac = ChaCha20Poly1305.encrypt(shared_secret, nonce, plaintext, serialize(Q))
+
+The serialization of Q is included as part of the HMAC but not encrypted. Additional data may be added here, including date/time of the backup, depending on the properties desired by the wallet. Note that this may interfere with the deterministic nature of the wallet payload should the wallet add date/time properties, which may expend more resources like bandwidth or storage space.
+
+{|!Field||# Bytes||Description
+|-
+| sec ephemeral public key || 33 || serialize(Q)
+|-
+| hmac || 16 || from the encrypt function
+|-
+| ciphertext || varies || from the encrypt function
+|}
+
+The decryption process starts with calculating the shared secret and then using a round of SHA256 to derive the key.
+
+s = private key
+Q = deserialize(sec ephemeral public key)
+shared_secret = SHA256(serialize(s*Q))
+
+The nonce can be derived from the ephemeral public key. The shared secret can be derived using the ephemeral public key and private key. The shared secret and nonce together can decrypt the ciphertext and verify the HMAC.
+
+nonce = SHA256(Q)[:12]
+plaintext = ChaCha20Poly1305.decrypt(shared_secret, nonce, ciphertext, hmac, serialize(Q))
+
+Note again that the serialization of Q must go into the additional data for the calculation of the HMAC.
+
+==== Ephemeral Private Key Generation ====
+
+To ensure that the ephemeral private key is sufficiently random, implementations can use the SHA256 of the plaintext for the ephemeral key, ''k''. This isn't required, but has the property of the encrypted payload staying the static if nothig has changed.
+
+== Test Vectors and Reference Code ==
+
+TODO
+
+== Acknowledgements ==
+
+TODO
